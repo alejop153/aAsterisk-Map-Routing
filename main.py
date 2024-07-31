@@ -1,6 +1,4 @@
 import pandas as pd
-import geopandas as gpd
-from shapely.geometry import Point, LineString
 import matplotlib.pyplot as plt
 import osmnx as ox
 from fastapi import FastAPI, Body, HTTPException
@@ -10,7 +8,7 @@ from pydantic import BaseModel
 import io
 from collections import defaultdict
 from AlexAi import Node, Tree  # Importar las clases Node y Tree
-from utils import process_geometry  # Importar la función process_geometry
+import json
 
 ox.config(use_cache=True, log_console=True)
 
@@ -27,57 +25,61 @@ app.add_middleware(
 
 
 class Intersection(Node):
+    # Cargar JSON desde un archivo
+    with open('final_df.json', 'r', encoding='utf-8') as file:
+        data = json.load(file)
 
-    def __init__(self, adjacents, node_coords, end_node):
+    def __init__(self, state, adjacents, node_coords, end_node, operators=[], operator=None, parent=None, objective=None):
+        # Asegúrate de pasar los parámetros iniciales a la clase base
+        super().__init__(state, operators, operator=operator, parent=parent, objective=objective)
+
         self.adjacents = adjacents
         self.node_coords = node_coords
         self.end_node = end_node
-
-        self.vel_acum = 0 if self.parent is None else self.parent.vel_p_acum + self.velocity()
+        self.vel_acum = 0 if parent is None else parent.vel_acum + self.velocity()
 
     def getchildrens(self):
-        return [
-            state
-            if not self.repeatStatePath(state)
-            else None for state in self.adjacents.get(self.state, [])
-        ]
+        return [state if not self.repeatStatePath(state) else None for state in self.adjacents.get(self.state, [])]
 
     def get_promedio_vel_acum(self):
-        return self.vel_acum / self.level
+        return self.vel_acum / self.level if self.level != 0 else 0
 
     def heuristic(self):
         if self.state == self.end_node:
             return 0
         else:
-            return self.node_coords[self.state].distance(self.node_coords[self.end_node]) * 100000 / self.get_promedio_vel_acum()
+            return self.node_coords[self.state].distance(self.node_coords[self.end_node]) * 100000 / (self.get_promedio_vel_acum() if self.get_promedio_vel_acum() != 0 else 1)
 
     def velocity(self):
         if self.parent is None:
             return 0
-        return 50  # Se calcula a traves de la API de Mapbox como el promedio de las velocidades de annotation.speed
+        u = str(self.parent.state)
+        v = str(self.state)
+        return self.data[u][v]['velocidad'] if v in self.data[u] else 0
 
     def cost(self):
         if self.parent is None:
             return 0
-        # Es el weight que nos entrega la API de Mapbox
-        return self.node_coords[self.state].distance(self.node_coords[self.parent.state]) * 100000
+        u = str(self.parent.state)
+        v = str(self.state)
+        return self.data[u][v]['peso'] if v in self.data[u] else 0
 
+    
 
 # Definir el modelo de datos para la solicitud
 
 class MapRequest(BaseModel):
     city_selected: str
-    transport_mode_selected: str
     init_node: dict
     final_node: dict
 
 # Función para construir el grafo y las estructuras de datos
 
 
-def build_graph(city, transport_mode):
+def build_graph(city, transport_mode='drive'):
     G = ox.graph_from_place(city, network_type=transport_mode, simplify=True)
     gdf_nodes, gdf_edges = ox.graph_to_gdfs(G)
-
+    
     adjacents = defaultdict(list)
     for u, v, k in gdf_edges.index:
         adjacents[u].append(v)
@@ -149,28 +151,25 @@ async def render_map(city: str = 'Envigado, Antioquia, Colombia', transport_mode
 @app.post("/render_map_with_data")
 async def render_map_with_data(data: MapRequest = Body(...)):
     city = data.city_selected
-    transport_mode = data.transport_mode_selected
     start_lat = data.init_node['lat']
     start_lon = data.init_node['lon']
     end_lat = data.final_node['lat']
     end_lon = data.final_node['lon']
 
-    G, adjacents, node_coords = build_graph(city, transport_mode)
+    G, adjacents, node_coords = build_graph(city)
     try:
         start_node = ox.nearest_nodes(G, Y=start_lat, X=start_lon)
         end_node = ox.nearest_nodes(G, Y=end_lat, X=end_lon)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    MapaTree = Tree(Intersection(state=start_node, operators=[], objective=end_node,
-                    adjacents=adjacents, node_coords=node_coords, end_node=end_node))
+    MapaTree = Tree(Intersection(state=start_node, adjacents=adjacents, node_coords=node_coords, end_node=end_node, objective=end_node))
     MapaTree.aAsterisk(endState=end_node)
     path_nodes = MapaTree.pathStates()
 
     if not path_nodes:
         raise HTTPException(status_code=404, detail="Route not found")
 
-    # Generar el mapa con la ruta
     try:
         fig, ax = ox.plot_graph_route(
             G, path_nodes, route_linewidth=6, node_size=0, bgcolor='k', show=False, close=False)
@@ -181,3 +180,4 @@ async def render_map_with_data(data: MapRequest = Body(...)):
     plt.savefig(buf, format='png')
     buf.seek(0)
     return StreamingResponse(buf, media_type="image/png")
+
